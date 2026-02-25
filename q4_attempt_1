@@ -1,0 +1,195 @@
+# crn_verify.py
+# Copy-paste into VS Code, save as crn_verify.py, then hit ▶ Run.
+# (ASCII-only output to avoid Windows cp1252 encoding issues.)
+
+import math
+import random
+import sys
+from collections import Counter
+
+# Optional: force UTF-8 output on newer Python (safe even if console isn't UTF-8)
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# ----------------------------
+# Combinatorics for propensities
+# ----------------------------
+def nCk(n: int, k: int) -> int:
+    if n < k:
+        return 0
+    if k == 0:
+        return 1
+    if k == 1:
+        return n
+    if k == 2:
+        return n * (n - 1) // 2
+    out = 1
+    for i in range(1, k + 1):
+        out = out * (n - (k - i)) // i
+    return out
+
+# ----------------------------
+# Reaction + SSA engine
+# ----------------------------
+class Reaction:
+    def __init__(self, reactants: dict, products: dict, rate: float, name: str):
+        self.r = Counter({k: v for k, v in reactants.items() if v})
+        self.p = Counter({k: v for k, v in products.items() if v})
+        self.k = float(rate)
+        self.name = name
+
+    def propensity(self, state: Counter) -> float:
+        a = self.k
+        for sp, m in self.r.items():
+            a *= nCk(state.get(sp, 0), m)
+            if a == 0:
+                return 0.0
+        return float(a)
+
+    def fire(self, state: Counter) -> None:
+        for sp, m in self.r.items():
+            state[sp] -= m
+            if state[sp] <= 0:
+                del state[sp]
+        for sp, m in self.p.items():
+            state[sp] = state.get(sp, 0) + m
+
+def gillespie_ssa(
+    reactions,
+    init_state: dict,
+    *,
+    seed: int = 0,
+    max_steps: int = 5_000_000,
+    tmax: float = 1e9,
+    stop_when=None,
+):
+    rng = random.Random(seed)
+    state = Counter({k: v for k, v in init_state.items() if v > 0})
+    t = 0.0
+
+    for step in range(max_steps):
+        if stop_when is not None and stop_when(state, t, step):
+            return state, t, step
+
+        props = [rx.propensity(state) for rx in reactions]
+        a0 = sum(props)
+        if a0 <= 0.0:
+            return state, t, step
+
+        r1 = rng.random()
+        dt = -math.log(max(r1, 1e-300)) / a0
+        t += dt
+        if t > tmax:
+            return state, t, step
+
+        r2 = rng.random() * a0
+        cum = 0.0
+        for rx, a in zip(reactions, props):
+            cum += a
+            if r2 <= cum:
+                rx.fire(state)
+                break
+
+    return state, t, max_steps
+
+# ----------------------------
+# Rate tiers (strong separation)
+# faster >> fast >> medium >> slow >> very_slow
+# ----------------------------
+R = {
+    "faster":    1_000.0,
+    "fast":        100.0,
+    "medium":        1.0,
+    "slow":      1e-3,
+    "very_slow": 1e-9,
+}
+
+# ============================================================
+# A) YOUR EXACT CRN (24 reactions): log(Y0)->l, then z = X0*l (gated by D)
+# ============================================================
+def build_user_crn_24():
+    rx = []
+
+    # Module A: Logarithm (computes l and emits DONE D)
+    rx.append(Reaction({"u": 1}, {"u": 1, "s": 1}, R["slow"], "1) u -> u+s"))
+    rx.append(Reaction({"s": 1, "y": 2}, {"y": 2}, R["fast"], "2) s+2y -> 2y"))
+    rx.append(Reaction({"u": 1, "y": 2}, {"u": 1, "y1": 1}, R["fast"], "3) u+2y -> u+y1"))
+    rx.append(Reaction({"u": 1, "s": 1, "y1": 1}, {"v": 1, "s": 1, "y1": 1}, R["fast"], "4) u+s+y1 -> v+s+y1"))
+    rx.append(Reaction({"u": 1}, {"u": 1, "t": 1}, R["very_slow"], "5) u -> u+t"))
+    rx.append(Reaction({"t": 1, "y": 2}, {"y": 2}, R["fast"], "6) t+2y -> 2y"))
+    rx.append(Reaction({"t": 1, "y1": 1}, {"y1": 1}, R["fast"], "7) t+y1 -> y1"))
+    rx.append(Reaction({"u": 1, "t": 1}, {"D": 1}, R["medium"], "8) u+t -> D"))
+    rx.append(Reaction({"v": 1}, {"v": 1, "s1": 1}, R["slow"], "9) v -> v+s1"))
+    rx.append(Reaction({"s1": 1, "y1": 1}, {"y1": 1}, R["fast"], "10) s1+y1 -> y1"))
+    rx.append(Reaction({"v": 1, "y1": 1}, {"v": 1, "y": 1}, R["fast"], "11) v+y1 -> v+y"))
+    rx.append(Reaction({"v": 1, "s1": 1}, {"u": 1, "l": 1, "s1": 1}, R["fast"], "12) v+s1 -> u+l+s1"))
+    rx.append(Reaction({"s": 1}, {}, R["medium"], "13) s -> 0"))
+    rx.append(Reaction({"s1": 1}, {}, R["medium"], "14) s1 -> 0"))
+    rx.append(Reaction({"t": 1}, {}, R["medium"], "15) t -> 0"))
+
+    # Module B: Multiplication (computes z = X0 * l_inf, gated by D)
+    rx.append(Reaction({"g": 1, "x": 1, "D": 1}, {"p": 1, "D": 1}, R["slow"], "16) g+x+D -> p+D"))
+    rx.append(Reaction({"p": 1}, {"p": 1, "sl": 1}, R["slow"], "17) p -> p+sl"))
+    rx.append(Reaction({"l": 1, "sl": 1}, {"l": 1}, R["faster"], "18) l+sl -> l"))
+    rx.append(Reaction({"p": 1, "l": 1}, {"p": 1, "r": 1, "z1": 1}, R["faster"], "19) p+l -> p+r+z1"))
+    rx.append(Reaction({"p": 1, "sl": 1}, {"q": 1, "sl": 1}, R["very_slow"], "20) p+sl -> q+sl"))
+    rx.append(Reaction({"q": 1, "r": 1}, {"q": 1, "l": 1}, R["faster"], "21) q+r -> q+l"))
+    rx.append(Reaction({"q": 1, "sl": 1}, {"q": 1}, R["faster"], "22) q+sl -> q"))
+    rx.append(Reaction({"q": 1}, {"g": 1}, R["medium"], "23) q -> g"))
+    rx.append(Reaction({"z1": 1}, {"z": 1}, R["medium"], "24) z1 -> z"))
+
+    return rx
+
+def stop_user_crn(state: Counter, t: float, step: int) -> bool:
+    # Stop when D exists, x=0, and key transient species are gone.
+    transients = ["u", "v", "p", "q", "y1", "r", "z1", "sl"]
+    return (
+        state.get("D", 0) > 0
+        and state.get("x", 0) == 0
+        and all(state.get(sp, 0) == 0 for sp in transients)
+    )
+
+def run_verification_user_crn(num_runs_per_case: int = 50):
+    rx = build_user_crn_24()
+    print("\n=== Verify YOUR 24-reaction CRN: z(inf) = X0 * log2(Y0) for Y0 power-of-two ===")
+    print(f"Rates: faster={R['faster']} fast={R['fast']} medium={R['medium']} slow={R['slow']} very_slow={R['very_slow']}")
+    print("Stop rule: D exists, x=0, and {u,v,p,q,y1,r,z1,sl}=0.\n")
+
+    cases = []
+    for X0 in [0, 1, 2, 3, 5, 7]:
+        for Y0 in [1, 2, 4, 8, 16, 32]:
+            expected_l = int(round(math.log2(Y0)))  # exact for powers of 2; 0 for 1
+            expected_z = X0 * expected_l
+            cases.append((X0, Y0, expected_l, expected_z))
+
+    for (X0, Y0, expected_l, expected_z) in cases:
+        successes = 0
+        zs = []
+        ls = []
+        for r_i in range(num_runs_per_case):
+            seed = 1_000_000 + 97 * X0 + 131 * Y0 + 10_000 * r_i
+            init = {"x": X0, "y": Y0, "u": 1, "g": 1}
+            out, t, steps = gillespie_ssa(rx, init, seed=seed, stop_when=stop_user_crn, tmax=1e8)
+            z = out.get("z", 0)
+            l = out.get("l", 0)
+            zs.append(z)
+            ls.append(l)
+            if z == expected_z:
+                successes += 1
+
+        z_mode = max(set(zs), key=zs.count)
+        l_mode = max(set(ls), key=ls.count)
+        print(
+            f"X0={X0:2d}, Y0={Y0:2d} | expected l={expected_l:2d}, z={expected_z:3d} "
+            f"| success {successes:2d}/{num_runs_per_case} | mode(l)={l_mode:2d}, mode(z)={z_mode:3d}"
+        )
+
+    print("\nIf you see occasional failures: increase separation (e.g., faster=1e5 and/or very_slow=1e-12).")
+
+# ----------------------------
+# MAIN
+# ----------------------------
+if __name__ == "__main__":
+    run_verification_user_crn(num_runs_per_case=50)

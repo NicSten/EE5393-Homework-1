@@ -1,0 +1,124 @@
+import random, math
+from collections import Counter
+
+def nCk(n,k):
+    if n < k: return 0
+    if k == 0: return 1
+    if k == 1: return n
+    if k == 2: return n*(n-1)//2
+    out = 1
+    for i in range(1,k+1):
+        out = out*(n-(k-i))//i
+    return out
+
+class Reaction:
+    def __init__(self, reactants, products, rate, name):
+        self.r = Counter(reactants)
+        self.p = Counter(products)
+        self.k = rate
+        self.name = name
+
+    def prop(self, x):
+        a = self.k
+        for sp,m in self.r.items():
+            a *= nCk(x.get(sp,0), m)
+            if a == 0: return 0.0
+        return float(a)
+
+    def fire(self, x):
+        for sp,m in self.r.items():
+            x[sp] -= m
+            if x[sp] == 0: del x[sp]
+        for sp,m in self.p.items():
+            x[sp] = x.get(sp,0) + m
+
+def build_crn():
+    k = dict(
+        log_probe_s = 1e-3,
+        log_probe_t = 1e-7,
+        log_destroy = 50.0,
+        log_pair    = 50.0,
+        log_switch  = 5.0,
+        log_term    = 1.0,
+        sink        = 0.1,
+        mul_start   = 1e-3,
+        mul_sl_prod = 1e-5,
+        mul_sl_kill = 200.0,
+        mul_sweep   = 200.0,
+        mul_switch  = 1e-10,
+        mul_restore = 200.0,
+        mul_return  = 0.1,
+        mul_zconv   = 0.1
+    )
+
+    R = []
+    # Log
+    R += [
+        Reaction({'u':1},{'u':1,'s':1}, k['log_probe_s'], 'u->u+s'),
+        Reaction({'s':1,'y':2},{'y':2}, k['log_destroy'], 's+2y->2y'),
+        Reaction({'u':1,'y':2},{'u':1,'y1':1}, k['log_pair'], 'u+2y->u+y1'),
+        Reaction({'u':1,'s':1,'y1':1},{'v':1,'s':1,'y1':1}, k['log_switch'], 'u+s+y1->v+s+y1'),
+
+        Reaction({'u':1},{'u':1,'t':1}, k['log_probe_t'], 'u->u+t'),
+        Reaction({'t':1,'y':2},{'y':2}, k['log_destroy'], 't+2y->2y'),
+        Reaction({'t':1,'y1':1},{'y1':1}, k['log_destroy'], 't+y1->y1'),
+        Reaction({'u':1,'t':1},{'D':1}, k['log_term'], 'u+t->D'),
+
+        Reaction({'v':1},{'v':1,'s1':1}, k['log_probe_s'], 'v->v+s1'),
+        Reaction({'s1':1,'y1':1},{'y1':1}, k['log_destroy'], 's1+y1->y1'),
+        Reaction({'v':1,'y1':1},{'v':1,'y':1}, k['log_pair'], 'v+y1->v+y'),
+        Reaction({'v':1,'s1':1},{'u':1,'l':1,'s1':1}, k['log_switch'], 'v+s1->u+l+s1'),
+
+        Reaction({'s':1},{}, k['sink'], 's->0'),
+        Reaction({'s1':1},{}, k['sink'], 's1->0'),
+        Reaction({'t':1},{}, k['sink'], 't->0'),
+    ]
+
+    # Multiply (gated by D)
+    R += [
+        Reaction({'g':1,'x':1,'D':1},{'p':1,'D':1}, k['mul_start'], 'g+x+D->p+D'),
+        Reaction({'p':1},{'p':1,'sl':1}, k['mul_sl_prod'], 'p->p+sl'),
+        Reaction({'l':1,'sl':1},{'l':1}, k['mul_sl_kill'], 'l+sl->l'),
+        Reaction({'p':1,'l':1},{'p':1,'r':1,'z1':1}, k['mul_sweep'], 'p+l->p+r+z1'),
+        Reaction({'p':1,'sl':1},{'q':1,'sl':1}, k['mul_switch'], 'p+sl->q+sl'),
+        Reaction({'q':1,'r':1},{'q':1,'l':1}, k['mul_restore'], 'q+r->q+l'),
+        Reaction({'q':1,'sl':1},{'q':1}, k['mul_restore'], 'q+sl->q'),
+        Reaction({'q':1},{'g':1}, k['mul_return'], 'q->g'),
+        Reaction({'z1':1},{'z':1}, k['mul_zconv'], 'z1->z'),
+    ]
+    return R
+
+def ssa(R, init, seed=0, max_steps=3_000_000):
+    rng = random.Random(seed)
+    x = Counter({k:v for k,v in init.items() if v})
+    for _ in range(max_steps):
+        # stop once D exists, x depleted, and no active transient states
+        core = ['u','v','p','q','y1','r','z1']
+        if x.get('D',0) > 0 and x.get('x',0) == 0 and all(x.get(s,0)==0 for s in core):
+            return x
+        props = [rx.prop(x) for rx in R]
+        a0 = sum(props)
+        if a0 == 0: return x
+        r2 = rng.random()*a0
+        c = 0.0
+        for rx,p in zip(R, props):
+            c += p
+            if r2 <= c:
+                rx.fire(x)
+                break
+    return x
+
+if __name__ == "__main__":
+    R = build_crn()
+    tests = [
+        (3, 8,  9),
+        (5, 32, 25),
+        (7, 2,  7),
+        (6, 4,  12),
+        (4, 16, 16),
+        (1, 8,  3),
+    ]
+    for X0,Y0,expected in tests:
+        init = {'x':X0,'y':Y0,'u':1,'g':1}
+        out = ssa(R, init, seed=0)
+        print((X0,Y0), "l=", out.get('l',0), "z=", out.get('z',0), "expected", expected)
